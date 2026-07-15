@@ -8,14 +8,17 @@ import websockets
 # Port configuration for Render
 PORT = int(os.environ.get("PORT", 8000))
 
-# Queues mapped by unique combination keys: "board_size:infinity:blitz"
-matchmaking_queues = {
+# =========================================================================
+# 1. TIC-TAC-TOE STATE & LOGIC
+# =========================================================================
+# State dictionaries safely isolated for Tic-Tac-Toe
+ttt_queues = {
     "3:0:0": [], "3:1:0": [], "3:0:1": [], "3:1:1": [],
     "5:0:0": [], "5:1:0": [], "5:0:1": [], "5:1:1": []
 }
-active_rooms = {}
+ttt_rooms = {}
 
-class Room:
+class TicTacToeRoom:
     def __init__(self, room_id, size, infinity, blitz, p1_ws, p2_ws):
         self.room_id = room_id
         self.board_size = size
@@ -62,7 +65,7 @@ class Room:
 
     async def _timer_worker(self):
         try:
-            await asyncio.sleep(5.5) # Server-side leeway for network lag
+            await asyncio.sleep(5.5) 
             available = [i for i, val in enumerate(self.board) if val == ""]
             if available and not self.game_over:
                 random_idx = random.choice(available)
@@ -139,8 +142,8 @@ class Room:
         except Exception:
             pass
 
-
-async def handler(websocket):
+async def tictactoe_logic(websocket):
+    """ Handles all connections routed to /tictactoe """
     assigned_room_id = None
     assigned_queue_key = None
     
@@ -155,7 +158,7 @@ async def handler(websocket):
                 blitz = data.get("blitz", 0)
                 assigned_queue_key = f"{size}:{inf}:{blitz}"
                 
-                queue = matchmaking_queues[assigned_queue_key]
+                queue = ttt_queues[assigned_queue_key]
                 if websocket not in queue:
                     queue.append(websocket)
 
@@ -164,8 +167,8 @@ async def handler(websocket):
                     p2 = queue.pop(0)
                     room_id = str(uuid.uuid4())
                     
-                    new_room = Room(room_id, size, inf, blitz, p1, p2)
-                    active_rooms[room_id] = new_room
+                    new_room = TicTacToeRoom(room_id, size, inf, blitz, p1, p2)
+                    ttt_rooms[room_id] = new_room
                     
                     p1.room_id = room_id; p1.symbol = 'X'
                     p2.room_id = room_id; p2.symbol = 'O'
@@ -181,29 +184,76 @@ async def handler(websocket):
             elif action == "submit_move":
                 room_id = getattr(websocket, 'room_id', None)
                 symbol = getattr(websocket, 'symbol', None)
-                if room_id in active_rooms:
-                    await active_rooms[room_id].process_move(symbol, data.get("index"))
+                if room_id in ttt_rooms:
+                    await ttt_rooms[room_id].process_move(symbol, data.get("index"))
 
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Tic-Tac-Toe Error: {e}")
     finally:
-        if assigned_queue_key and websocket in matchmaking_queues[assigned_queue_key]:
-            matchmaking_queues[assigned_queue_key].remove(websocket)
+        # Cleanup disconnected players
+        if assigned_queue_key and websocket in ttt_queues[assigned_queue_key]:
+            ttt_queues[assigned_queue_key].remove(websocket)
             
         room_id = getattr(websocket, 'room_id', None)
-        if room_id in active_rooms:
-            room = active_rooms[room_id]
+        if room_id in ttt_rooms:
+            room = ttt_rooms[room_id]
             await room.terminate_on_disconnect(websocket)
-            if room_id in active_rooms:
-                del active_rooms[room_id]
+            if room_id in ttt_rooms:
+                del ttt_rooms[room_id]
 
+# =========================================================================
+# 2. CHECKERBOARD STATE & LOGIC (PLACEHOLDER)
+# =========================================================================
+checkerboard_queues = {}
+checkerboard_rooms = {}
 
+async def checkerboard_logic(websocket):
+    """ Handles all connections routed to /checkerboard """
+    try:
+        print("A player joined the Checkerboard lobby!")
+        await websocket.send(json.dumps({"action": "connected", "message": "Checkerboard server is alive!"}))
+        
+        async for msg in websocket:
+            data = json.loads(msg)
+            # Future Checkerboard logic will go here
+            pass
+            
+    except websockets.exceptions.ConnectionClosed:
+        print("A player left the Checkerboard lobby.")
+    except Exception as e:
+        print(f"Checkerboard Error: {e}")
+
+# =========================================================================
+# 3. MASTER CONNECTION ROUTER
+# =========================================================================
+async def connection_router(websocket, path=""):
+    """ Intercepts all incoming connections and routes them by URL path """
+    
+    # Extract path safely (Supports both modern and legacy 'websockets' versions)
+    req_path = getattr(websocket, "path", path)
+    print(f"New connection requested on path: {req_path}")
+    
+    if req_path == "/tictactoe":
+        await tictactoe_logic(websocket)
+        
+    elif req_path == "/checkerboard":
+        await checkerboard_logic(websocket)
+        
+    else:
+        print(f"Rejected unauthorized path: {req_path}")
+        await websocket.close(code=1008, reason="Invalid game path requested.")
+
+# =========================================================================
+# 4. SERVER INITIALIZATION
+# =========================================================================
 async def main():
-    print(f"Starting server on port {PORT}...")
-    async with websockets.serve(handler, "0.0.0.0", PORT, ping_interval=10, ping_timeout=10):
-        await asyncio.Future()  # Run forever
+    print(f"Master Multi-Game Server booting up on port {PORT}...")
+    
+    # We pass the router to handle connections
+    async with websockets.serve(connection_router, "0.0.0.0", PORT, ping_interval=10, ping_timeout=10):
+        await asyncio.Future()  # Keep server running forever
 
 if __name__ == "__main__":
     asyncio.run(main())
