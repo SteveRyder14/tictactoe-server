@@ -16,7 +16,7 @@ ttt_queues = {
     "5:0:0": [], "5:1:0": [], "5:0:1": [], "5:1:1": []
 }
 ttt_rooms = {}
-ttt_player_state = {}  # SAFE STATE TRACKER: Maps a websocket to its room_id and symbol
+ttt_player_state = {} 
 
 class TicTacToeRoom:
     def __init__(self, room_id, size, infinity, blitz, p1_ws, p2_ws):
@@ -142,11 +142,8 @@ class TicTacToeRoom:
         except Exception:
             pass
 
-
 async def tictactoe_logic(websocket):
-    """ Handles all connections routed to /tictactoe """
     assigned_queue_key = None
-    
     try:
         async for msg in websocket:
             data = json.loads(msg)
@@ -170,7 +167,6 @@ async def tictactoe_logic(websocket):
                     new_room = TicTacToeRoom(room_id, size, inf, blitz, p1, p2)
                     ttt_rooms[room_id] = new_room
                     
-                    # Safe dictionary tracking instead of modifying websocket.__slots__
                     ttt_player_state[p1] = {"room_id": room_id, "symbol": "X"}
                     ttt_player_state[p2] = {"room_id": room_id, "symbol": "O"}
 
@@ -197,11 +193,8 @@ async def tictactoe_logic(websocket):
     except Exception as e:
         print(f"Tic-Tac-Toe Error: {e}")
     finally:
-        # 1. Remove from queue if they disconnect while searching
         if assigned_queue_key and websocket in ttt_queues[assigned_queue_key]:
             ttt_queues[assigned_queue_key].remove(websocket)
-            
-        # 2. End match gracefully if they disconnect mid-game
         state = ttt_player_state.get(websocket)
         if state:
             room_id = state["room_id"]
@@ -209,37 +202,100 @@ async def tictactoe_logic(websocket):
                 room = ttt_rooms[room_id]
                 await room.terminate_on_disconnect(websocket)
                 del ttt_rooms[room_id]
-            # Delete their tracker
             del ttt_player_state[websocket]
 
 # =========================================================================
-# 2. CHECKERBOARD STATE & LOGIC (PLACEHOLDER)
+# 2. CHECKERBOARD MULTIPLAYER STATE & LOGIC
 # =========================================================================
-checkerboard_queues = {}
-checkerboard_rooms = {}
+cb_queue = []
+cb_rooms = {}
+cb_player_state = {}
+
+class CheckerboardRoom:
+    def __init__(self, room_id, p1_ws, p2_ws):
+        self.room_id = room_id
+        self.players = {1: p1_ws, 2: p2_ws}
+        self.current_turn = 1
+
+    async def process_move(self, color, start, end):
+        # Validate turn sync
+        if color != self.current_turn: return
+        self.current_turn = 2 if color == 1 else 1
+        
+        # Relay move strictly to the OPPONENT
+        other_color = self.current_turn
+        try:
+            await self.players[other_color].send(json.dumps({
+                "action": "state_update",
+                "start": start,
+                "end": end
+            }))
+        except Exception:
+            pass
+
+    async def terminate_on_disconnect(self, disconnected_ws):
+        remaining_color = 2 if self.players[1] == disconnected_ws else 1
+        try:
+            await self.players[remaining_color].send(json.dumps({
+                "action": "opponent_disconnected"
+            }))
+        except Exception:
+            pass
 
 async def checkerboard_logic(websocket):
-    """ Handles all connections routed to /checkerboard """
+    assigned_queue = False
     try:
-        print("A player joined the Checkerboard lobby!")
-        await websocket.send(json.dumps({"action": "connected", "message": "Checkerboard server is alive!"}))
-        
         async for msg in websocket:
             data = json.loads(msg)
-            # Future Checkerboard logic will go here
-            pass
-            
+            action = data.get("action")
+
+            if action == "join_queue":
+                if websocket not in cb_queue:
+                    cb_queue.append(websocket)
+                    assigned_queue = True
+                
+                # Matchmaker
+                if len(cb_queue) >= 2:
+                    p1 = cb_queue.pop(0)
+                    p2 = cb_queue.pop(0)
+                    room_id = str(uuid.uuid4())
+                    
+                    new_room = CheckerboardRoom(room_id, p1, p2)
+                    cb_rooms[room_id] = new_room
+                    
+                    # 1 = BLUE (Bottom), 2 = RED (Top)
+                    cb_player_state[p1] = {"room_id": room_id, "color": 1}
+                    cb_player_state[p2] = {"room_id": room_id, "color": 2}
+
+                    await p1.send(json.dumps({"action": "match_start", "color": 1}))
+                    await p2.send(json.dumps({"action": "match_start", "color": 2}))
+
+            elif action == "submit_move":
+                state = cb_player_state.get(websocket)
+                if state:
+                    room = cb_rooms.get(state["room_id"])
+                    if room:
+                        await room.process_move(state["color"], data.get("start"), data.get("end"))
+
     except websockets.exceptions.ConnectionClosed:
-        print("A player left the Checkerboard lobby.")
+        pass
     except Exception as e:
         print(f"Checkerboard Error: {e}")
+    finally:
+        if assigned_queue and websocket in cb_queue:
+            cb_queue.remove(websocket)
+        state = cb_player_state.get(websocket)
+        if state:
+            room_id = state["room_id"]
+            if room_id in cb_rooms:
+                await cb_rooms[room_id].terminate_on_disconnect(websocket)
+                del cb_rooms[room_id]
+            del cb_player_state[websocket]
 
 # =========================================================================
 # 3. MASTER CONNECTION ROUTER
 # =========================================================================
 async def connection_router(websocket, path=None):
-    """ Intercepts all incoming connections and routes them safely by URL """
-    
     if hasattr(websocket, 'request'):
         req_path = websocket.request.path 
     else:
@@ -249,21 +305,18 @@ async def connection_router(websocket, path=None):
     
     if req_path == "/tictactoe":
         await tictactoe_logic(websocket)
-        
     elif req_path == "/checkerboard":
         await checkerboard_logic(websocket)
-        
     else:
-        print(f"Rejected unauthorized path: {req_path}")
         await websocket.close(code=1008, reason="Invalid game path requested.")
 
 # =========================================================================
 # 4. SERVER INITIALIZATION
 # =========================================================================
 async def main():
-    print(f"Master Multi-Game Server booting up on port {PORT}...")
+    print(f"Master Server booting up on port {PORT}...")
     async with websockets.serve(connection_router, "0.0.0.0", PORT):
-        await asyncio.Future()  # Keep server running forever
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
