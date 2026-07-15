@@ -11,12 +11,12 @@ PORT = int(os.environ.get("PORT", 8000))
 # =========================================================================
 # 1. TIC-TAC-TOE STATE & LOGIC
 # =========================================================================
-# State dictionaries safely isolated for Tic-Tac-Toe
 ttt_queues = {
     "3:0:0": [], "3:1:0": [], "3:0:1": [], "3:1:1": [],
     "5:0:0": [], "5:1:0": [], "5:0:1": [], "5:1:1": []
 }
 ttt_rooms = {}
+ttt_player_state = {}  # SAFE STATE TRACKER: Maps a websocket to its room_id and symbol
 
 class TicTacToeRoom:
     def __init__(self, room_id, size, infinity, blitz, p1_ws, p2_ws):
@@ -142,9 +142,9 @@ class TicTacToeRoom:
         except Exception:
             pass
 
+
 async def tictactoe_logic(websocket):
     """ Handles all connections routed to /tictactoe """
-    assigned_room_id = None
     assigned_queue_key = None
     
     try:
@@ -170,9 +170,9 @@ async def tictactoe_logic(websocket):
                     new_room = TicTacToeRoom(room_id, size, inf, blitz, p1, p2)
                     ttt_rooms[room_id] = new_room
                     
-                    p1.room_id = room_id; p1.symbol = 'X'
-                    p2.room_id = room_id; p2.symbol = 'O'
-                    assigned_room_id = room_id
+                    # Safe dictionary tracking instead of modifying websocket.__slots__
+                    ttt_player_state[p1] = {"room_id": room_id, "symbol": "X"}
+                    ttt_player_state[p2] = {"room_id": room_id, "symbol": "O"}
 
                     await p1.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": "X", "current_turn": "X"}))
                     await p2.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": "O", "current_turn": "X"}))
@@ -182,26 +182,35 @@ async def tictactoe_logic(websocket):
                     await websocket.send(json.dumps({"action": "queued"}))
 
             elif action == "submit_move":
-                room_id = getattr(websocket, 'room_id', None)
-                symbol = getattr(websocket, 'symbol', None)
-                if room_id in ttt_rooms:
-                    await ttt_rooms[room_id].process_move(symbol, data.get("index"))
+                state = ttt_player_state.get(websocket)
+                if state:
+                    room_id = state["room_id"]
+                    symbol = state["symbol"]
+                    if room_id in ttt_rooms:
+                        await ttt_rooms[room_id].process_move(symbol, data.get("index"))
+                        
+            elif action == "ping":
+                await websocket.send(json.dumps({"action": "pong"}))
 
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
         print(f"Tic-Tac-Toe Error: {e}")
     finally:
-        # Cleanup disconnected players
+        # 1. Remove from queue if they disconnect while searching
         if assigned_queue_key and websocket in ttt_queues[assigned_queue_key]:
             ttt_queues[assigned_queue_key].remove(websocket)
             
-        room_id = getattr(websocket, 'room_id', None)
-        if room_id in ttt_rooms:
-            room = ttt_rooms[room_id]
-            await room.terminate_on_disconnect(websocket)
+        # 2. End match gracefully if they disconnect mid-game
+        state = ttt_player_state.get(websocket)
+        if state:
+            room_id = state["room_id"]
             if room_id in ttt_rooms:
+                room = ttt_rooms[room_id]
+                await room.terminate_on_disconnect(websocket)
                 del ttt_rooms[room_id]
+            # Delete their tracker
+            del ttt_player_state[websocket]
 
 # =========================================================================
 # 2. CHECKERBOARD STATE & LOGIC (PLACEHOLDER)
@@ -228,12 +237,15 @@ async def checkerboard_logic(websocket):
 # =========================================================================
 # 3. MASTER CONNECTION ROUTER
 # =========================================================================
-async def connection_router(websocket, path=""):
-    """ Intercepts all incoming connections and routes them by URL path """
+async def connection_router(websocket, path=None):
+    """ Intercepts all incoming connections and routes them safely by URL """
     
-    # Extract path safely (Supports both modern and legacy 'websockets' versions)
-    req_path = getattr(websocket, "path", path)
-    print(f"New connection requested on path: {req_path}")
+    if hasattr(websocket, 'request'):
+        req_path = websocket.request.path 
+    else:
+        req_path = path or getattr(websocket, 'path', '/')
+        
+    print(f"Incoming connection to: {req_path}")
     
     if req_path == "/tictactoe":
         await tictactoe_logic(websocket)
@@ -250,9 +262,7 @@ async def connection_router(websocket, path=""):
 # =========================================================================
 async def main():
     print(f"Master Multi-Game Server booting up on port {PORT}...")
-    
-    # We pass the router to handle connections
-    async with websockets.serve(connection_router, "0.0.0.0", PORT, ping_interval=10, ping_timeout=10):
+    async with websockets.serve(connection_router, "0.0.0.0", PORT):
         await asyncio.Future()  # Keep server running forever
 
 if __name__ == "__main__":
