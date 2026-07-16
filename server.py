@@ -32,7 +32,7 @@ class TicTacToeRoom:
         self.game_over = False
         self.pieces = {'X': [], 'O': []}
         self.timer_task = None
-        self.rematch_requests = set()  # Tracks who pressed 'Rematch'
+        self.rematch_requests = set()
         self.win_lines = self.get_lines(size)
 
     def get_lines(self, size):
@@ -136,11 +136,9 @@ class TicTacToeRoom:
         return False
 
     async def handle_rematch_request(self, symbol):
-        """ Handles logic for when a player presses the 'Rematch' button """
         self.rematch_requests.add(symbol)
         logging.info(f"Tic-Tac-Toe: Room {self.room_id} - {symbol} requested a rematch.")
         
-        # If both players have clicked rematch, wipe the board and restart!
         if len(self.rematch_requests) == 2:
             self.board = [""] * (self.board_size * self.board_size)
             self.pieces = {'X': [], 'O': []}
@@ -148,7 +146,7 @@ class TicTacToeRoom:
             self.game_over = False
             self.rematch_requests.clear()
             
-            logging.info(f"Tic-Tac-Toe: Room {self.room_id} - Rematch Accepted! Restarting game.")
+            logging.info(f"Tic-Tac-Toe: Room {self.room_id} - Rematch Accepted!")
             await self.broadcast({
                 "action": "rematch_accepted",
                 "current_turn": "X"
@@ -156,9 +154,11 @@ class TicTacToeRoom:
             await self.start_blitz_countdown()
 
     async def terminate_on_disconnect(self, disconnected_ws):
-        if self.game_over: 
+        # FIX: Ensure we always notify the remaining player so they never get stuck!
+        if getattr(self, 'disconnect_notified', False):
             return
-            
+        self.disconnect_notified = True
+        
         self.game_over = True
         self.cancel_timer()
         remaining_symbol = 'O' if self.players['X'] == disconnected_ws else 'X'
@@ -166,7 +166,7 @@ class TicTacToeRoom:
         if not self.players[remaining_symbol].closed:
             try:
                 await self.players[remaining_symbol].send(json.dumps({
-                    "action": "game_over",
+                    "action": "opponent_disconnected",
                     "winner": remaining_symbol,
                     "winning_line": [],
                     "reason": "disconnect"
@@ -245,7 +245,6 @@ async def tictactoe_logic(websocket):
                     if room_id and room_id in ttt_rooms and isinstance(index, int):
                         await ttt_rooms[room_id].process_move(symbol, index)
             
-            # --- NEW REMATCH ACTION ---            
             elif action == "request_rematch":
                 state = ttt_player_state.get(websocket)
                 if state:
@@ -333,7 +332,10 @@ class CheckerboardRoom:
 
     async def terminate_on_disconnect(self, disconnected_ws):
         remaining_color = 2 if self.players[1] == disconnected_ws else 1
-        
+        if getattr(self, 'disconnect_notified', False):
+            return
+        self.disconnect_notified = True
+
         if not self.players[remaining_color].closed:
             try:
                 await self.players[remaining_color].send(json.dumps({
