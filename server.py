@@ -3,7 +3,11 @@ import json
 import uuid
 import random
 import os
+import logging
 import websockets
+
+# Configure logging for Render Dashboard
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Port configuration for Render
 PORT = int(os.environ.get("PORT", 8000))
@@ -45,10 +49,14 @@ class TicTacToeRoom:
             ]
 
     async def broadcast(self, payload):
+        """ Sequentially broadcasts to prevent unhandled exceptions if a socket drops mid-send """
         message = json.dumps(payload)
-        tasks = [asyncio.create_task(ws.send(message)) for ws in self.players.values()]
-        if tasks:
-            await asyncio.wait(tasks)
+        for symbol, ws in self.players.items():
+            if not ws.closed:
+                try:
+                    await ws.send(message)
+                except Exception as e:
+                    logging.warning(f"Failed to broadcast to {symbol}: {e}")
 
     def cancel_timer(self):
         if self.timer_task:
@@ -129,27 +137,34 @@ class TicTacToeRoom:
         return False
 
     async def terminate_on_disconnect(self, disconnected_ws):
-        # FIX: Prevents the repeating 5-second bug if players quit after the match is already over!
         if self.game_over: 
             return
             
         self.game_over = True
         self.cancel_timer()
         remaining_symbol = 'O' if self.players['X'] == disconnected_ws else 'X'
-        try:
-            await self.players[remaining_symbol].send(json.dumps({
-                "action": "game_over",
-                "winner": remaining_symbol,
-                "winning_line": [],
-                "reason": "disconnect"
-            }))
-        except Exception:
-            pass
+        
+        if not self.players[remaining_symbol].closed:
+            try:
+                await self.players[remaining_symbol].send(json.dumps({
+                    "action": "game_over",
+                    "winner": remaining_symbol,
+                    "winning_line": [],
+                    "reason": "disconnect"
+                }))
+            except Exception:
+                pass
 
 async def tictactoe_logic(websocket):
+    assigned_queue_key = None
+    assigned_symbol = None
     try:
         async for msg in websocket:
-            data = json.loads(msg)
+            try:
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                continue
+
             action = data.get("action")
 
             if action == "join_queue":
@@ -160,14 +175,13 @@ async def tictactoe_logic(websocket):
                 
                 queue_key = f"{size}:{inf}:{blitz}"
                 
-                # Check if this exact rule combination exists, if not, build it.
                 if queue_key not in ttt_queues:
                     ttt_queues[queue_key] = {'X': [], 'O': []}
                     
                 queue = ttt_queues[queue_key]
                 opp_symbol = 'O' if symbol == 'X' else 'X'
 
-                # FIX: Hunt down ghost sockets and remove them so players only match with living sockets
+                # Safe Ghost Connection Search
                 opp_ws = None
                 while len(queue[opp_symbol]) > 0:
                     potential_opp = queue[opp_symbol].pop(0)
@@ -192,12 +206,12 @@ async def tictactoe_logic(websocket):
                         await p1.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": "X", "current_turn": "X"}))
                         await p2.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": "O", "current_turn": "X"}))
                         await new_room.start_blitz_countdown()
+                        logging.info(f"Tic-Tac-Toe: Match started in '{queue_key}'.")
                     except Exception as e:
-                        print(f"Match start failed: {e}")
+                        logging.error(f"TTT Match start failed: {e}")
                         await new_room.terminate_on_disconnect(my_ws)
                         ttt_rooms.pop(room_id, None)
                 else:
-                    # No live opponent found. Park them in their isolated symbol queue.
                     if websocket not in queue[symbol]:
                         queue[symbol].append(websocket)
                         ttt_player_state[websocket] = {"queue_key": queue_key, "symbol": symbol}
@@ -217,32 +231,31 @@ async def tictactoe_logic(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
-        print(f"Tic-Tac-Toe Error: {e}")
+        logging.error(f"Tic-Tac-Toe Error: {e}")
     finally:
         state = ttt_player_state.get(websocket)
         if state:
             queue_key = state.get("queue_key")
             symbol = state.get("symbol")
             
-            # Safely remove from waiting queue
             if queue_key and symbol:
                 q = ttt_queues.get(queue_key)
                 if q and websocket in q[symbol]:
                     q[symbol].remove(websocket)
             
-            # Safely terminate game
             room_id = state.get("room_id")
             if room_id and room_id in ttt_rooms:
                 room = ttt_rooms[room_id]
                 await room.terminate_on_disconnect(websocket)
                 ttt_rooms.pop(room_id, None)
+                logging.info(f"Tic-Tac-Toe: Room {room_id} closed due to disconnect.")
             
-            del ttt_player_state[websocket]
+            ttt_player_state.pop(websocket, None)
 
 # =========================================================================
 # 2. CHECKERBOARD MULTIPLAYER STATE & LOGIC
 # =========================================================================
-cb_queues = {} # Groups waiting players by their exact game rules
+cb_queues = {} 
 cb_rooms = {}
 cb_player_state = {}
 
@@ -266,7 +279,7 @@ class CheckerboardRoom:
                 "end": end
             }))
         except Exception as e:
-            print(f"Checkerboard move relay failed: {e}")
+            logging.error(f"Checkerboard move relay failed: {e}")
 
     async def terminate_on_disconnect(self, disconnected_ws):
         remaining_color = 2 if self.players[1] == disconnected_ws else 1
@@ -278,7 +291,6 @@ class CheckerboardRoom:
             pass
 
 async def checkerboard_logic(websocket):
-    """ Handles all connections routed to /checkerboard """
     assigned_queue_key = None
     assigned_color = None
     
@@ -302,33 +314,46 @@ async def checkerboard_logic(websocket):
                     
                 assigned_queue_key = queue_key
                 assigned_color = color
-                
                 opp_color = 2 if color == 1 else 1
                 queue = cb_queues[queue_key]
                 
-                if len(queue[opp_color]) > 0:
-                    opp_ws = queue[opp_color].pop(0)
+                # Safe Ghost Connection Search (Fixed for Checkerboard)
+                opp_ws = None
+                while len(queue[opp_color]) > 0:
+                    potential_opp = queue[opp_color].pop(0)
+                    if not potential_opp.closed:
+                        opp_ws = potential_opp
+                        break
+
+                if opp_ws is not None:
                     my_ws = websocket
-                    
                     room_id = str(uuid.uuid4())
                     new_room = CheckerboardRoom(room_id, my_ws if color==1 else opp_ws, my_ws if color==2 else opp_ws)
                     cb_rooms[room_id] = new_room
                     
-                    cb_player_state[my_ws] = {"room_id": room_id, "color": color}
-                    cb_player_state[opp_ws] = {"room_id": room_id, "color": opp_color}
+                    cb_player_state[my_ws] = {"room_id": room_id, "color": color, "queue_key": queue_key}
+                    cb_player_state[opp_ws] = {"room_id": room_id, "color": opp_color, "queue_key": queue_key}
                     
-                    await my_ws.send(json.dumps({"action": "match_start", "color": color}))
-                    await opp_ws.send(json.dumps({"action": "match_start", "color": opp_color}))
+                    try:
+                        await my_ws.send(json.dumps({"action": "match_start", "color": color}))
+                        await opp_ws.send(json.dumps({"action": "match_start", "color": opp_color}))
+                        logging.info(f"Checkerboard: Match started in '{queue_key}'. Room ID: {room_id}")
+                    except Exception as e:
+                        logging.error(f"CB Match start failed: {e}")
+                        await new_room.terminate_on_disconnect(my_ws)
+                        cb_rooms.pop(room_id, None)
                 else:
                     if websocket not in queue[color]:
                         queue[color].append(websocket)
-                        
+                        cb_player_state[websocket] = {"queue_key": queue_key, "color": color}
+                        logging.info(f"Checkerboard: Player joined queue '{queue_key}'")
+
             elif action == "submit_move":
                 state = cb_player_state.get(websocket)
                 if state:
-                    room = cb_rooms.get(state["room_id"])
-                    if room:
-                        await room.process_move(state["color"], data.get("start"), data.get("end"))
+                    room_id = state.get("room_id")
+                    if room_id and room_id in cb_rooms:
+                        await cb_rooms[room_id].process_move(state["color"], data.get("start"), data.get("end"))
 
             elif action == "ping":
                 await websocket.send(json.dumps({"action": "pong"}))
@@ -336,21 +361,23 @@ async def checkerboard_logic(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
-        print(f"Checkerboard Error: {e}")
+        logging.error(f"Checkerboard Error: {e}")
     finally:
         if assigned_queue_key and assigned_color:
             queue = cb_queues.get(assigned_queue_key)
             if queue and websocket in queue[assigned_color]:
                 queue[assigned_color].remove(websocket)
+                logging.info(f"Checkerboard: Player left queue '{assigned_queue_key}'")
             
         state = cb_player_state.get(websocket)
         if state:
-            room_id = state["room_id"]
-            if room_id in cb_rooms:
+            room_id = state.get("room_id")
+            if room_id and room_id in cb_rooms:
                 await cb_rooms[room_id].terminate_on_disconnect(websocket)
-                del cb_rooms[room_id]
+                cb_rooms.pop(room_id, None)
+                logging.info(f"Checkerboard: Room {room_id} closed due to disconnect.")
             if websocket in cb_player_state:
-                del cb_player_state[websocket]
+                cb_player_state.pop(websocket, None)
 
 # =========================================================================
 # 3. MASTER CONNECTION ROUTER
@@ -361,22 +388,24 @@ async def connection_router(websocket, path=None):
     else:
         req_path = path or getattr(websocket, 'path', '/')
         
-    print(f"Incoming connection to: {req_path}")
+    logging.info(f"Incoming connection to: {req_path}")
     
     if req_path == "/tictactoe":
         await tictactoe_logic(websocket)
     elif req_path == "/checkerboard":
         await checkerboard_logic(websocket)
     else:
-        print(f"Rejected unauthorized path: {req_path}")
+        logging.warning(f"Rejected unauthorized path: {req_path}")
         await websocket.close(code=1008, reason="Invalid game path requested.")
 
 # =========================================================================
 # 4. SERVER INITIALIZATION
 # =========================================================================
 async def main():
-    print(f"Master Multi-Game Server booting up on port {PORT}...")
-    async with websockets.serve(connection_router, "0.0.0.0", PORT):
+    logging.info(f"Master Multi-Game Server booting up on port {PORT}...")
+    
+    # Highly stabilized mobile ping tolerances (60s interval / 120s timeout)
+    async with websockets.serve(connection_router, "0.0.0.0", PORT, ping_interval=60, ping_timeout=120):
         await asyncio.Future()
 
 if __name__ == "__main__":
