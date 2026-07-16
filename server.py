@@ -3,11 +3,7 @@ import json
 import uuid
 import random
 import os
-import logging
 import websockets
-
-# Configure logging for Render Dashboard
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Port configuration for Render
 PORT = int(os.environ.get("PORT", 8000))
@@ -26,7 +22,7 @@ class TicTacToeRoom:
         self.infinity = infinity
         self.blitz = blitz
         
-        # p1_ws is ALWAYS X, p2_ws is ALWAYS O
+        # p1 is ALWAYS X, p2 is ALWAYS O
         self.players = {'X': p1_ws, 'O': p2_ws}
         self.current_turn = 'X'
         self.board = [""] * (size * size)
@@ -111,6 +107,7 @@ class TicTacToeRoom:
             vals = [self.board[idx] for idx in line]
             if vals[0] != "" and vals.count(vals[0]) == len(line):
                 self.game_over = True
+                self.cancel_timer()
                 await self.broadcast({
                     "action": "game_over",
                     "winner": vals[0],
@@ -121,6 +118,7 @@ class TicTacToeRoom:
 
         if "" not in self.board:
             self.game_over = True
+            self.cancel_timer()
             await self.broadcast({
                 "action": "game_over",
                 "winner": None,
@@ -131,6 +129,10 @@ class TicTacToeRoom:
         return False
 
     async def terminate_on_disconnect(self, disconnected_ws):
+        # FIX: Prevents the repeating 5-second bug if players quit after the match is already over!
+        if self.game_over: 
+            return
+            
         self.game_over = True
         self.cancel_timer()
         remaining_symbol = 'O' if self.players['X'] == disconnected_ws else 'X'
@@ -145,34 +147,35 @@ class TicTacToeRoom:
             pass
 
 async def tictactoe_logic(websocket):
-    assigned_queue_key = None
-    assigned_symbol = None
     try:
         async for msg in websocket:
-            try:
-                data = json.loads(msg)
-            except json.JSONDecodeError:
-                continue
-
+            data = json.loads(msg)
             action = data.get("action")
 
             if action == "join_queue":
                 size = data.get("board_size", 3)
                 inf = data.get("infinity", 0)
                 blitz = data.get("blitz", 0)
-                symbol = data.get("symbol", "X") 
+                symbol = data.get("symbol", "X")
                 
-                assigned_queue_key = f"{size}:{inf}:{blitz}"
-                assigned_symbol = symbol
-                opp_symbol = 'O' if symbol == 'X' else 'X'
+                queue_key = f"{size}:{inf}:{blitz}"
                 
-                if assigned_queue_key not in ttt_queues:
-                    ttt_queues[assigned_queue_key] = {'X': [], 'O': []}
+                # Check if this exact rule combination exists, if not, build it.
+                if queue_key not in ttt_queues:
+                    ttt_queues[queue_key] = {'X': [], 'O': []}
                     
-                queue = ttt_queues[assigned_queue_key]
+                queue = ttt_queues[queue_key]
+                opp_symbol = 'O' if symbol == 'X' else 'X'
 
-                if len(queue[opp_symbol]) > 0:
-                    opp_ws = queue[opp_symbol].pop(0)
+                # FIX: Hunt down ghost sockets and remove them so players only match with living sockets
+                opp_ws = None
+                while len(queue[opp_symbol]) > 0:
+                    potential_opp = queue[opp_symbol].pop(0)
+                    if not potential_opp.closed:
+                        opp_ws = potential_opp
+                        break
+
+                if opp_ws is not None:
                     my_ws = websocket
                     room_id = str(uuid.uuid4())
                     
@@ -182,27 +185,31 @@ async def tictactoe_logic(websocket):
                     new_room = TicTacToeRoom(room_id, size, inf, blitz, p1, p2)
                     ttt_rooms[room_id] = new_room
                     
-                    ttt_player_state[my_ws] = {"room_id": room_id, "symbol": symbol}
-                    ttt_player_state[opp_ws] = {"room_id": room_id, "symbol": opp_symbol}
+                    ttt_player_state[my_ws] = {"room_id": room_id, "symbol": symbol, "queue_key": queue_key}
+                    ttt_player_state[opp_ws] = {"room_id": room_id, "symbol": opp_symbol, "queue_key": queue_key}
 
-                    await my_ws.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": symbol, "current_turn": "X"}))
-                    await opp_ws.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": opp_symbol, "current_turn": "X"}))
-                    logging.info(f"Tic-Tac-Toe: Match started. Room ID: {room_id}")
-                    
-                    await new_room.start_blitz_countdown()
+                    try:
+                        await p1.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": "X", "current_turn": "X"}))
+                        await p2.send(json.dumps({"action": "match_start", "room_id": room_id, "assigned_symbol": "O", "current_turn": "X"}))
+                        await new_room.start_blitz_countdown()
+                    except Exception as e:
+                        print(f"Match start failed: {e}")
+                        await new_room.terminate_on_disconnect(my_ws)
+                        ttt_rooms.pop(room_id, None)
                 else:
+                    # No live opponent found. Park them in their isolated symbol queue.
                     if websocket not in queue[symbol]:
                         queue[symbol].append(websocket)
+                        ttt_player_state[websocket] = {"queue_key": queue_key, "symbol": symbol}
                     await websocket.send(json.dumps({"action": "queued"}))
 
             elif action == "submit_move":
                 state = ttt_player_state.get(websocket)
                 if state:
-                    room_id = state["room_id"]
-                    symbol = state["symbol"]
-                    room = ttt_rooms.get(room_id)
-                    if room:
-                        await room.process_move(symbol, data.get("index"))
+                    room_id = state.get("room_id")
+                    symbol = state.get("symbol")
+                    if room_id and room_id in ttt_rooms:
+                        await ttt_rooms[room_id].process_move(symbol, data.get("index"))
                         
             elif action == "ping":
                 await websocket.send(json.dumps({"action": "pong"}))
@@ -210,28 +217,32 @@ async def tictactoe_logic(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
-        logging.error(f"Tic-Tac-Toe Error: {e}")
+        print(f"Tic-Tac-Toe Error: {e}")
     finally:
-        # 1. Safely clean queue
-        if assigned_queue_key and assigned_symbol:
-            queue = ttt_queues.get(assigned_queue_key)
-            if queue and websocket in queue[assigned_symbol]:
-                queue[assigned_symbol].remove(websocket)
-                
-        # 2. Safely clean room and state using .pop() to prevent KeyErrors
         state = ttt_player_state.get(websocket)
         if state:
-            room_id = state["room_id"]
-            room = ttt_rooms.pop(room_id, None)
-            if room:
+            queue_key = state.get("queue_key")
+            symbol = state.get("symbol")
+            
+            # Safely remove from waiting queue
+            if queue_key and symbol:
+                q = ttt_queues.get(queue_key)
+                if q and websocket in q[symbol]:
+                    q[symbol].remove(websocket)
+            
+            # Safely terminate game
+            room_id = state.get("room_id")
+            if room_id and room_id in ttt_rooms:
+                room = ttt_rooms[room_id]
                 await room.terminate_on_disconnect(websocket)
-                logging.info(f"Tic-Tac-Toe: Room {room_id} closed due to disconnect.")
-            ttt_player_state.pop(websocket, None)
+                ttt_rooms.pop(room_id, None)
+            
+            del ttt_player_state[websocket]
 
 # =========================================================================
 # 2. CHECKERBOARD MULTIPLAYER STATE & LOGIC
 # =========================================================================
-cb_queues = {} 
+cb_queues = {} # Groups waiting players by their exact game rules
 cb_rooms = {}
 cb_player_state = {}
 
@@ -255,7 +266,7 @@ class CheckerboardRoom:
                 "end": end
             }))
         except Exception as e:
-            logging.error(f"Checkerboard move relay failed: {e}")
+            print(f"Checkerboard move relay failed: {e}")
 
     async def terminate_on_disconnect(self, disconnected_ws):
         remaining_color = 2 if self.players[1] == disconnected_ws else 1
@@ -267,6 +278,7 @@ class CheckerboardRoom:
             pass
 
 async def checkerboard_logic(websocket):
+    """ Handles all connections routed to /checkerboard """
     assigned_queue_key = None
     assigned_color = None
     
@@ -290,6 +302,7 @@ async def checkerboard_logic(websocket):
                     
                 assigned_queue_key = queue_key
                 assigned_color = color
+                
                 opp_color = 2 if color == 1 else 1
                 queue = cb_queues[queue_key]
                 
@@ -306,12 +319,10 @@ async def checkerboard_logic(websocket):
                     
                     await my_ws.send(json.dumps({"action": "match_start", "color": color}))
                     await opp_ws.send(json.dumps({"action": "match_start", "color": opp_color}))
-                    logging.info(f"Checkerboard: Match started in '{queue_key}'. Room ID: {room_id}")
                 else:
                     if websocket not in queue[color]:
                         queue[color].append(websocket)
-                        logging.info(f"Checkerboard: Player joined queue '{queue_key}' as Color {color}")
-
+                        
             elif action == "submit_move":
                 state = cb_player_state.get(websocket)
                 if state:
@@ -325,24 +336,21 @@ async def checkerboard_logic(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
-        logging.error(f"Checkerboard Error: {e}")
+        print(f"Checkerboard Error: {e}")
     finally:
-        # 1. Safely clean queue
         if assigned_queue_key and assigned_color:
             queue = cb_queues.get(assigned_queue_key)
             if queue and websocket in queue[assigned_color]:
                 queue[assigned_color].remove(websocket)
-                logging.info(f"Checkerboard: Player left queue '{assigned_queue_key}'")
             
-        # 2. Safely clean room and state using .pop() to prevent KeyErrors
         state = cb_player_state.get(websocket)
         if state:
             room_id = state["room_id"]
-            room = cb_rooms.pop(room_id, None)
-            if room:
-                await room.terminate_on_disconnect(websocket)
-                logging.info(f"Checkerboard: Room {room_id} closed due to disconnect.")
-            cb_player_state.pop(websocket, None)
+            if room_id in cb_rooms:
+                await cb_rooms[room_id].terminate_on_disconnect(websocket)
+                del cb_rooms[room_id]
+            if websocket in cb_player_state:
+                del cb_player_state[websocket]
 
 # =========================================================================
 # 3. MASTER CONNECTION ROUTER
@@ -353,23 +361,22 @@ async def connection_router(websocket, path=None):
     else:
         req_path = path or getattr(websocket, 'path', '/')
         
-    logging.info(f"Incoming connection to: {req_path}")
+    print(f"Incoming connection to: {req_path}")
     
     if req_path == "/tictactoe":
         await tictactoe_logic(websocket)
     elif req_path == "/checkerboard":
         await checkerboard_logic(websocket)
     else:
-        logging.warning(f"Rejected unauthorized path: {req_path}")
+        print(f"Rejected unauthorized path: {req_path}")
         await websocket.close(code=1008, reason="Invalid game path requested.")
 
 # =========================================================================
 # 4. SERVER INITIALIZATION
 # =========================================================================
 async def main():
-    logging.info(f"Master Multi-Game Server booting up on port {PORT}...")
-    # Added native ping_interval=20 to prevent Render 55s timeout disconnects
-    async with websockets.serve(connection_router, "0.0.0.0", PORT, ping_interval=20, ping_timeout=20):
+    print(f"Master Multi-Game Server booting up on port {PORT}...")
+    async with websockets.serve(connection_router, "0.0.0.0", PORT):
         await asyncio.Future()
 
 if __name__ == "__main__":
