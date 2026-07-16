@@ -32,6 +32,7 @@ class TicTacToeRoom:
         self.game_over = False
         self.pieces = {'X': [], 'O': []}
         self.timer_task = None
+        self.rematch_requests = set()  # Tracks who pressed 'Rematch'
         self.win_lines = self.get_lines(size)
 
     def get_lines(self, size):
@@ -134,6 +135,26 @@ class TicTacToeRoom:
             return True
         return False
 
+    async def handle_rematch_request(self, symbol):
+        """ Handles logic for when a player presses the 'Rematch' button """
+        self.rematch_requests.add(symbol)
+        logging.info(f"Tic-Tac-Toe: Room {self.room_id} - {symbol} requested a rematch.")
+        
+        # If both players have clicked rematch, wipe the board and restart!
+        if len(self.rematch_requests) == 2:
+            self.board = [""] * (self.board_size * self.board_size)
+            self.pieces = {'X': [], 'O': []}
+            self.current_turn = 'X'
+            self.game_over = False
+            self.rematch_requests.clear()
+            
+            logging.info(f"Tic-Tac-Toe: Room {self.room_id} - Rematch Accepted! Restarting game.")
+            await self.broadcast({
+                "action": "rematch_accepted",
+                "current_turn": "X"
+            })
+            await self.start_blitz_countdown()
+
     async def terminate_on_disconnect(self, disconnected_ws):
         if self.game_over: 
             return
@@ -221,10 +242,18 @@ async def tictactoe_logic(websocket):
                     symbol = state.get("symbol")
                     index = data.get("index")
                     
-                    # SAFETY FIX: Ensure index is a valid integer before processing
                     if room_id and room_id in ttt_rooms and isinstance(index, int):
                         await ttt_rooms[room_id].process_move(symbol, index)
-                        
+            
+            # --- NEW REMATCH ACTION ---            
+            elif action == "request_rematch":
+                state = ttt_player_state.get(websocket)
+                if state:
+                    room_id = state.get("room_id")
+                    symbol = state.get("symbol")
+                    if room_id and room_id in ttt_rooms:
+                        await ttt_rooms[room_id].handle_rematch_request(symbol)
+
             elif action == "leave_match":
                 state = ttt_player_state.get(websocket)
                 if state:
@@ -305,7 +334,6 @@ class CheckerboardRoom:
     async def terminate_on_disconnect(self, disconnected_ws):
         remaining_color = 2 if self.players[1] == disconnected_ws else 1
         
-        # SAFETY FIX: Verify the remaining player socket is active before sending
         if not self.players[remaining_color].closed:
             try:
                 await self.players[remaining_color].send(json.dumps({
@@ -378,11 +406,9 @@ async def checkerboard_logic(websocket):
                     start_pos = data.get("start")
                     end_pos = data.get("end")
                     
-                    # SAFETY FIX: Ensure position payloads exist before processing
                     if room_id and room_id in cb_rooms and start_pos is not None and end_pos is not None:
                         await cb_rooms[room_id].process_move(state["color"], start_pos, end_pos)
             
-            # CONSISTENCY FIX: Apply explicit quit handlers to Checkerboard too!
             elif action == "leave_match":
                 state = cb_player_state.get(websocket)
                 if state:
