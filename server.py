@@ -15,7 +15,7 @@ PORT = int(os.environ.get("PORT", 8000))
 # =========================================================================
 # 1. TIC-TAC-TOE STATE & LOGIC
 # =========================================================================
-ttt_queues = {} # Dynamically generates matching buckets for X and O
+ttt_queues = {} 
 ttt_rooms = {}
 ttt_player_state = {} 
 
@@ -26,7 +26,6 @@ class TicTacToeRoom:
         self.infinity = infinity
         self.blitz = blitz
         
-        # p1 is ALWAYS X, p2 is ALWAYS O
         self.players = {'X': p1_ws, 'O': p2_ws}
         self.current_turn = 'X'
         self.board = [""] * (size * size)
@@ -49,7 +48,6 @@ class TicTacToeRoom:
             ]
 
     async def broadcast(self, payload):
-        """ Sequentially broadcasts to prevent unhandled exceptions if a socket drops mid-send """
         message = json.dumps(payload)
         for symbol, ws in self.players.items():
             if not ws.closed:
@@ -181,7 +179,6 @@ async def tictactoe_logic(websocket):
                 queue = ttt_queues[queue_key]
                 opp_symbol = 'O' if symbol == 'X' else 'X'
 
-                # Safe Ghost Connection Search
                 opp_ws = None
                 while len(queue[opp_symbol]) > 0:
                     potential_opp = queue[opp_symbol].pop(0)
@@ -222,9 +219,33 @@ async def tictactoe_logic(websocket):
                 if state:
                     room_id = state.get("room_id")
                     symbol = state.get("symbol")
-                    if room_id and room_id in ttt_rooms:
-                        await ttt_rooms[room_id].process_move(symbol, data.get("index"))
+                    index = data.get("index")
+                    
+                    # SAFETY FIX: Ensure index is a valid integer before processing
+                    if room_id and room_id in ttt_rooms and isinstance(index, int):
+                        await ttt_rooms[room_id].process_move(symbol, index)
                         
+            elif action == "leave_match":
+                state = ttt_player_state.get(websocket)
+                if state:
+                    room_id = state.get("room_id")
+                    if room_id and room_id in ttt_rooms:
+                        room = ttt_rooms[room_id]
+                        await room.terminate_on_disconnect(websocket)
+                        ttt_rooms.pop(room_id, None)
+                        logging.info(f"Tic-Tac-Toe: Player explicitly left Room {room_id}")
+
+            elif action == "leave_queue":
+                state = ttt_player_state.get(websocket)
+                if state:
+                    queue_key = state.get("queue_key")
+                    symbol = state.get("symbol")
+                    if queue_key and symbol:
+                        q = ttt_queues.get(queue_key)
+                        if q and websocket in q[symbol]:
+                            q[symbol].remove(websocket)
+                            logging.info(f"Tic-Tac-Toe: Player explicitly left queue '{queue_key}'")
+
             elif action == "ping":
                 await websocket.send(json.dumps({"action": "pong"}))
 
@@ -283,12 +304,15 @@ class CheckerboardRoom:
 
     async def terminate_on_disconnect(self, disconnected_ws):
         remaining_color = 2 if self.players[1] == disconnected_ws else 1
-        try:
-            await self.players[remaining_color].send(json.dumps({
-                "action": "opponent_disconnected"
-            }))
-        except Exception:
-            pass
+        
+        # SAFETY FIX: Verify the remaining player socket is active before sending
+        if not self.players[remaining_color].closed:
+            try:
+                await self.players[remaining_color].send(json.dumps({
+                    "action": "opponent_disconnected"
+                }))
+            except Exception:
+                pass
 
 async def checkerboard_logic(websocket):
     assigned_queue_key = None
@@ -317,7 +341,6 @@ async def checkerboard_logic(websocket):
                 opp_color = 2 if color == 1 else 1
                 queue = cb_queues[queue_key]
                 
-                # Safe Ghost Connection Search (Fixed for Checkerboard)
                 opp_ws = None
                 while len(queue[opp_color]) > 0:
                     potential_opp = queue[opp_color].pop(0)
@@ -352,8 +375,34 @@ async def checkerboard_logic(websocket):
                 state = cb_player_state.get(websocket)
                 if state:
                     room_id = state.get("room_id")
+                    start_pos = data.get("start")
+                    end_pos = data.get("end")
+                    
+                    # SAFETY FIX: Ensure position payloads exist before processing
+                    if room_id and room_id in cb_rooms and start_pos is not None and end_pos is not None:
+                        await cb_rooms[room_id].process_move(state["color"], start_pos, end_pos)
+            
+            # CONSISTENCY FIX: Apply explicit quit handlers to Checkerboard too!
+            elif action == "leave_match":
+                state = cb_player_state.get(websocket)
+                if state:
+                    room_id = state.get("room_id")
                     if room_id and room_id in cb_rooms:
-                        await cb_rooms[room_id].process_move(state["color"], data.get("start"), data.get("end"))
+                        room = cb_rooms[room_id]
+                        await room.terminate_on_disconnect(websocket)
+                        cb_rooms.pop(room_id, None)
+                        logging.info(f"Checkerboard: Player explicitly left Room {room_id}")
+
+            elif action == "leave_queue":
+                state = cb_player_state.get(websocket)
+                if state:
+                    queue_key = state.get("queue_key")
+                    color = state.get("color")
+                    if queue_key and color:
+                        q = cb_queues.get(queue_key)
+                        if q and websocket in q[color]:
+                            q[color].remove(websocket)
+                            logging.info(f"Checkerboard: Player explicitly left queue '{queue_key}'")
 
             elif action == "ping":
                 await websocket.send(json.dumps({"action": "pong"}))
@@ -403,8 +452,6 @@ async def connection_router(websocket, path=None):
 # =========================================================================
 async def main():
     logging.info(f"Master Multi-Game Server booting up on port {PORT}...")
-    
-    # Highly stabilized mobile ping tolerances (60s interval / 120s timeout)
     async with websockets.serve(connection_router, "0.0.0.0", PORT, ping_interval=60, ping_timeout=120):
         await asyncio.Future()
 
