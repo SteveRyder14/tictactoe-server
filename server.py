@@ -154,7 +154,6 @@ class TicTacToeRoom:
             await self.start_blitz_countdown()
 
     async def terminate_on_disconnect(self, disconnected_ws):
-        # FIX: Ensure we always notify the remaining player so they never get stuck!
         if getattr(self, 'disconnect_notified', False):
             return
         self.disconnect_notified = True
@@ -301,6 +300,7 @@ async def tictactoe_logic(websocket):
             
             ttt_player_state.pop(websocket, None)
 
+
 # =========================================================================
 # 2. CHECKERBOARD MULTIPLAYER STATE & LOGIC
 # =========================================================================
@@ -313,6 +313,16 @@ class CheckerboardRoom:
         self.room_id = room_id
         self.players = {1: p1_ws, 2: p2_ws}
         self.current_turn = 1
+        self.rematch_requests = set()
+
+    async def broadcast(self, payload):
+        message = json.dumps(payload)
+        for color, ws in self.players.items():
+            if not ws.closed:
+                try:
+                    await ws.send(message)
+                except Exception as e:
+                    logging.warning(f"Failed to broadcast to {color}: {e}")
 
     async def process_move(self, color, start, end):
         if color != self.current_turn: 
@@ -322,13 +332,28 @@ class CheckerboardRoom:
         other_color = self.current_turn
         
         try:
-            await self.players[other_color].send(json.dumps({
-                "action": "state_update",
-                "start": start,
-                "end": end
-            }))
+            if not self.players[other_color].closed:
+                await self.players[other_color].send(json.dumps({
+                    "action": "state_update",
+                    "start": start,
+                    "end": end
+                }))
         except Exception as e:
             logging.error(f"Checkerboard move relay failed: {e}")
+
+    async def handle_rematch_request(self, color):
+        self.rematch_requests.add(color)
+        logging.info(f"Checkerboard: Room {self.room_id} - Color {color} requested a rematch.")
+        
+        if len(self.rematch_requests) == 2:
+            self.current_turn = 1
+            self.rematch_requests.clear()
+            
+            logging.info(f"Checkerboard: Room {self.room_id} - Rematch Accepted!")
+            await self.broadcast({
+                "action": "rematch_accepted",
+                "current_turn": 1
+            })
 
     async def terminate_on_disconnect(self, disconnected_ws):
         remaining_color = 2 if self.players[1] == disconnected_ws else 1
@@ -343,6 +368,7 @@ class CheckerboardRoom:
                 }))
             except Exception:
                 pass
+
 
 async def checkerboard_logic(websocket):
     assigned_queue_key = None
@@ -411,6 +437,14 @@ async def checkerboard_logic(websocket):
                     if room_id and room_id in cb_rooms and start_pos is not None and end_pos is not None:
                         await cb_rooms[room_id].process_move(state["color"], start_pos, end_pos)
             
+            elif action == "request_rematch":
+                state = cb_player_state.get(websocket)
+                if state:
+                    room_id = state.get("room_id")
+                    color = state.get("color")
+                    if room_id and room_id in cb_rooms:
+                        await cb_rooms[room_id].handle_rematch_request(color)
+            
             elif action == "leave_match":
                 state = cb_player_state.get(websocket)
                 if state:
@@ -440,21 +474,24 @@ async def checkerboard_logic(websocket):
     except Exception as e:
         logging.error(f"Checkerboard Error: {e}")
     finally:
-        if assigned_queue_key and assigned_color:
-            queue = cb_queues.get(assigned_queue_key)
-            if queue and websocket in queue[assigned_color]:
-                queue[assigned_color].remove(websocket)
-                logging.info(f"Checkerboard: Player left queue '{assigned_queue_key}'")
-            
         state = cb_player_state.get(websocket)
         if state:
+            queue_key = state.get("queue_key")
+            color = state.get("color")
+            
+            if queue_key and color:
+                q = cb_queues.get(queue_key)
+                if q and websocket in q[color]:
+                    q[color].remove(websocket)
+            
             room_id = state.get("room_id")
             if room_id and room_id in cb_rooms:
-                await cb_rooms[room_id].terminate_on_disconnect(websocket)
+                room = cb_rooms[room_id]
+                await room.terminate_on_disconnect(websocket)
                 cb_rooms.pop(room_id, None)
                 logging.info(f"Checkerboard: Room {room_id} closed due to disconnect.")
-            if websocket in cb_player_state:
-                cb_player_state.pop(websocket, None)
+            
+            cb_player_state.pop(websocket, None)
 
 # =========================================================================
 # 3. MASTER CONNECTION ROUTER
